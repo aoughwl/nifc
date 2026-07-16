@@ -1,0 +1,131 @@
+#!/usr/bin/env node
+// nifc — native (C) backend driver for nimony's post-hexer .c.nif IR.
+//
+//   nifc emit   <file.c.nif> [-o out.c]              emit a C translation unit
+//   nifc build  <file.c.nif> [-o bin] [--cc gcc]     emit C + compile to a native binary
+//   nifc run    <file.c.nif> [-- args…]              build the whole module and run it
+//   nifc exec   <file.c.nif> --entry NAME [--arg N…] build a harness that calls NAME and prints the result
+//   nifc c      <file.nim>   [--entry NAME --arg N…] .nim -> (nimony frontend+hexer) -> .c.nif -> native
+//
+// Options:
+//   -o, --out PATH     output path (.c for emit, binary for build)
+//   --cc CC            C compiler (default: gcc)
+//   --opt LEVEL        -O level passed to the C compiler (default: 2)
+//   --entry NAME       entry proc for `exec`/`c` harness mode
+//   --arg  VALUE       an argument to the entry proc (repeatable)
+//   --keep             keep intermediate .c file next to the output
+//   -S, --emit-c       for build/run/exec: also print the emitted C
+"use strict";
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const cp = require("child_process");
+const nifc = require(path.join(__dirname, "..", "nifc.js"));
+
+function parseArgs(argv) {
+  const o = { args: [], _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") { o._.push(...argv.slice(i + 1)); break; }
+    else if (a === "-o" || a === "--out") o.out = argv[++i];
+    else if (a === "--cc") o.cc = argv[++i];
+    else if (a === "--opt") o.opt = argv[++i];
+    else if (a === "--entry") o.entry = argv[++i];
+    else if (a === "--arg") o.args.push(argv[++i]);
+    else if (a === "--keep") o.keep = true;
+    else if (a === "-S" || a === "--emit-c") o.emitC = true;
+    else if (a === "--no-stubs") o.noStubs = true;
+    else o._.push(a);
+  }
+  return o;
+}
+
+// Turn a CLI value into a C literal expression for the harness call.
+function argToC(v) {
+  if (/^-?\d+$/.test(v)) return v.match(/^-?\d{1,9}$/) ? v : v + "LL";
+  if (/^-?\d*\.\d+([eE][-+]?\d+)?$/.test(v)) return v;
+  if (v === "true" || v === "false") return v === "true" ? "NIM_TRUE" : "NIM_FALSE";
+  return v; // pass through (e.g. an already-C expression)
+}
+
+function readSrc(file) {
+  if (!file) fail("missing input file");
+  if (!fs.existsSync(file)) fail("no such file: " + file);
+  return fs.readFileSync(file, "utf8");
+}
+function fail(msg) { console.error("nifc: " + msg); process.exit(1); }
+
+function baseName(file) {
+  return path.basename(file).replace(/\.c\.nif$|\.nif$|\.nim$/,"");
+}
+
+function ccCompile(cFile, outBin, opts) {
+  const cc = opts.cc || "gcc";
+  const optLevel = opts.opt != null ? String(opts.opt) : "2";
+  const args = [cFile, "-O" + optLevel, "-o", outBin, "-lm", "-w"];
+  const r = cp.spawnSync(cc, args, { encoding: "utf8" });
+  if (r.status !== 0) {
+    console.error(r.stderr || r.stdout || "");
+    fail(cc + " failed (status " + r.status + ")");
+  }
+  return outBin;
+}
+
+// Produce C for a whole-module build or a harness, depending on opts.entry.
+function toC(src, opts) {
+  if (opts.entry) return nifc.compileHarness(src, opts.entry, opts.args.map(argToC));
+  return nifc.compileModule(src, { stubExterns: !opts.noStubs });
+}
+
+function main() {
+  const argv = process.argv.slice(2);
+  const cmd = argv[0];
+  const o = parseArgs(argv.slice(1));
+
+  if (!cmd || cmd === "-h" || cmd === "--help" || cmd === "help") {
+    process.stdout.write(fs.readFileSync(__filename, "utf8").split("\n")
+      .slice(1, 22).map((l) => l.replace(/^\/\/ ?/, "")).join("\n") + "\n");
+    return;
+  }
+
+  if (cmd === "emit") {
+    const file = o._[0];
+    const c = toC(readSrc(file), o);
+    if (o.out) { fs.writeFileSync(o.out, c); console.error("nifc: wrote " + o.out); }
+    else process.stdout.write(c);
+    return;
+  }
+
+  if (cmd === "build" || cmd === "run" || cmd === "exec") {
+    const file = o._[0];
+    if (cmd === "exec" && !o.entry) fail("exec needs --entry NAME");
+    const src = readSrc(file);
+    const c = toC(src, o);
+    if (o.emitC) process.stdout.write(c + "\n");
+
+    const tmpDir = process.env.NIFC_TMP || fs.mkdtempSync(path.join(os.tmpdir(), "nifc-"));
+    const base = baseName(file);
+    const cFile = o.keep && o.out ? o.out.replace(/(\.[^.]*)?$/, ".c") : path.join(tmpDir, base + ".c");
+    fs.writeFileSync(cFile, c);
+    const outBin = o.out || (cmd === "build" ? path.join(process.cwd(), base) : path.join(tmpDir, base));
+    ccCompile(cFile, outBin, o);
+
+    if (cmd === "build") { console.error("nifc: built " + outBin); return; }
+    // run / exec: execute the binary
+    const r = cp.spawnSync(outBin, o._.slice(1), { stdio: "inherit" });
+    process.exit(r.status == null ? 0 : r.status);
+  }
+
+  if (cmd === "c") {
+    // .nim -> nimony (frontend + hexer, .c.nif) -> native
+    const nim = o._[0];
+    if (!nim) fail("c needs a .nim file");
+    fail("`nifc c` (driving nimony to emit .c.nif) is not wired in this build; " +
+      "run nimony's hexer to produce a .c.nif and use `nifc build`/`nifc exec` on it.");
+    return;
+  }
+
+  fail("unknown command '" + cmd + "'. Try `nifc help`.");
+}
+
+try { main(); } catch (e) { fail((e && e.message) || String(e)); }

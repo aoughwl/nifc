@@ -1,0 +1,14 @@
+{
+  "name": "nifc",
+  "version": "0.1.0",
+  "description": "A .c.nif -> C native backend for nimony (a printer over hexer's post-lowering IR; ARC is free)",
+  "keywords": ["nimony", "nif", "backend", "c-backend", "native", "hexer", "codegen"],
+  "main": "nifc.js",
+  "bin": { "nifc": "bin/nifc" },
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/aoughwl/nifc.git" },
+  "homepage": "https://aoughwl.github.io/docs/nifc"
+}

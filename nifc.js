@@ -335,6 +335,7 @@ class Emitter {
       case "neginf": return "-INF";
       case "nan": return "NAN";
       case "oconstr": case "aconstr": return this.genConstr(e);
+      case "ovf": return "LENGC_OVF_";   // read the overflow flag set by (keepovf ...)
       default: throw new Error("nifc: unsupported expr '" + t + "'");
     }
   }
@@ -760,6 +761,20 @@ function compileModule(snif, opts = {}) {
   for (const p of procs) { const nm = em.procParts(p).nameAtom.atom; procByName.set(nm, p); definedSyms.add(nm); }
   for (const g of globals) definedSyms.add(g.kids[0].atom);
 
+  // Forward-declare every object/union struct first, so a typedef that points
+  // to a struct defined later in source order still resolves (C11 lets the full
+  // `typedef struct NM {..} NM;` redeclare the same typedef).
+  const fwdDecls = [];
+  for (const td of types) {
+    const pragmas = td.kids.find((k) => isList(k) && k.tag === "pragmas");
+    if (em.hasPragma(pragmas, ["nodecl", "importc", "importcpp", "header"])) continue;
+    const body = td.kids[td.kids.length - 1];
+    if (isList(body) && (body.tag === "object" || body.tag === "union")) {
+      const nm = mangleToC(td.kids[0].atom);
+      fwdDecls.push("typedef " + (body.tag === "union" ? "union " : "struct ") + nm + " " + nm + ";");
+    }
+  }
+
   // type declarations (skip nodecl/importc)
   const typeDecls = [];
   for (const td of types) { const s = em.genTypeDecl(td); if (s) typeDecls.push(s); }
@@ -771,8 +786,10 @@ function compileModule(snif, opts = {}) {
     const parts = em.procParts(p);
     const sig = em.procSignature(p);
     if (!parts.body) { protos.push(sig.sig + ";"); continue; }
-    const isInline = parts.pragmas && em.hasPragma(parts.pragmas, ["inline"]);
-    if (!isInline) protos.push(sig.sig + ";");
+    // Emit a prototype for every proc, inline included: a `static inline` proc
+    // called before its definition otherwise gets an implicit (non-static)
+    // declaration, which then conflicts with the real static one.
+    protos.push(sig.sig + ";");
     defs.push(em.genProc(p));
   }
 
@@ -798,6 +815,7 @@ function compileModule(snif, opts = {}) {
 
   let out = PRELUDE + "\n";
   out += "/* --- error/overflow flags --- */\n_Thread_local NB8 LENGC_ERR_;\n_Thread_local NB8 LENGC_OVF_;\n\n";
+  if (fwdDecls.length) out += "/* --- forward type declarations --- */\n" + fwdDecls.join("\n") + "\n\n";
   if (typeDecls.length) out += "/* --- types --- */\n" + typeDecls.join("\n") + "\n\n";
   if (protos.length) out += "/* --- prototypes --- */\n" + protos.join("\n") + "\n\n";
   if (stubs.length) out += "/* --- external stubs --- */\n" + stubs.join("\n") + "\n\n";

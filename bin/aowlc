@@ -62,7 +62,7 @@ function baseName(file) {
 function ccCompile(cFile, outBin, opts) {
   const cc = opts.cc || "gcc";
   const optLevel = opts.opt != null ? String(opts.opt) : "2";
-  const args = [cFile, "-O" + optLevel, "-o", outBin, "-lm", "-w"];
+  const args = [cFile, "-O" + optLevel, "-o", outBin, "-lm", "-ldl", "-w"];
   const r = cp.spawnSync(cc, args, { encoding: "utf8" });
   if (r.status !== 0) {
     console.error(r.stderr || r.stdout || "");
@@ -113,6 +113,25 @@ function main() {
     if (cmd === "build") { console.error("aowlc: built " + outBin); return; }
     // run / exec: execute the binary
     const r = cp.spawnSync(outBin, o._.slice(1), { stdio: "inherit" });
+    process.exit(r.status == null ? 0 : r.status);
+  }
+
+  if (cmd === "link" || cmd === "link-run") {
+    // Link several .c.nif modules (a program + the real compiled system/syncio
+    // runtime) into ONE whole-program C translation unit, compile, and (link-run)
+    // execute. Symbols are content-addressed so cross-module refs resolve by name.
+    const files = o._;
+    if (!files.length) fail("link needs one or more .c.nif files");
+    const mods = files.map((f) => ({ src: readSrc(f), hash: baseName(f) }));
+    const c = aowlc.compileProgram(mods, { stubExterns: !o.noStubs });
+    if (o.emitC) process.stdout.write(c + "\n");
+    const tmpDir = process.env.AOWLC_TMP || fs.mkdtempSync(path.join(os.tmpdir(), "aowlc-"));
+    const cFile = o.keep && o.out ? o.out.replace(/(\.[^.]*)?$/, ".c") : path.join(tmpDir, "program.c");
+    fs.writeFileSync(cFile, c);
+    const outBin = o.out || path.join(cmd === "link-run" ? tmpDir : process.cwd(), "program");
+    ccCompile(cFile, outBin, o);
+    if (cmd === "link") { console.error("aowlc: linked " + outBin); return; }
+    const r = cp.spawnSync(outBin, [], { stdio: "inherit" });
     process.exit(r.status == null ? 0 : r.status);
   }
 

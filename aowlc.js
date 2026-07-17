@@ -858,10 +858,77 @@ function collectSyms(node, out) {
   return out;
 }
 
-// Emit a complete, self-contained C translation unit for the whole module.
+// Merge several classified modules into one program's worth of declarations.
+// Symbols are content-addressed (hashed) so names are globally unique across
+// modules; the only collisions are a symbol that appears as a stub/prototype in
+// one module and as the real definition in another — dedupe keeping the real one
+// (a type with a real body over an importc/nodecl reference; a proc WITH a body
+// over a bodiless prototype).
+// Content-addressed symbols name a module's OWN definitions with an empty
+// module-hash slot (`string.0.` -> `string_0_`), but OTHER modules reference the
+// same symbol with the hash filled in (`string.0.sysvq0asl` -> `string_0_sysvq0asl`).
+// To link modules into one TU, canonicalize each module's own symbols to their
+// global hashed form by filling the empty trailing slot with the module's hash
+// (its `.c.nif` basename) — so a definition and every cross-module reference to it
+// mangle to the same C name. Symbols already carrying a hash (externs) and global
+// instance names (no trailing dot) are left untouched.
+function canonicalizeOwnSyms(node, hash) {
+  if (isList(node)) { for (const k of node.kids) canonicalizeOwnSyms(k, hash); return; }
+  if (node && typeof node.atom === "string") {
+    const a = node.atom;
+    if (a.length > 1 && a.endsWith(".") && a.indexOf(".") !== a.length - 1 && a.split(".").length >= 3)
+      node.atom = a + hash;
+  }
+}
+
+// mods: [{ src, hash }] — src is the .c.nif text, hash the module's id (basename).
+function classifyProgram(mods) {
+  const em0 = new Emitter();
+  const isRealType = (td) => {
+    const prag = td.kids.find((k) => isList(k) && k.tag === "pragmas");
+    return !em0.hasPragma(prag, ["nodecl", "importc", "importcpp", "header"]);
+  };
+  const types = [], procs = [], globals = [], topStmts = [];
+  const tIdx = new Map(), pIdx = new Map(), gIdx = new Map();
+  for (const mod of mods) {
+    const nodes = readNif(mod.src);
+    for (const n of nodes) canonicalizeOwnSyms(n, mod.hash);
+    const c = classify(nodes);
+    for (const td of c.types) {
+      const nm = td.kids[0].atom, prev = tIdx.get(nm);
+      if (prev === undefined) { tIdx.set(nm, { i: types.length, real: isRealType(td) }); types.push(td); }
+      else if (isRealType(td) && !prev.real) { types[prev.i] = td; prev.real = true; }
+    }
+    for (const p of c.procs) {
+      const nm = em0.procParts(p).nameAtom.atom, prev = pIdx.get(nm);
+      const hasBody = !!em0.procParts(p).body;
+      if (prev === undefined) { pIdx.set(nm, { i: procs.length, body: hasBody }); procs.push(p); }
+      else if (hasBody && !prev.body) { procs[prev.i] = p; prev.body = true; }
+    }
+    for (const g of c.globals) {
+      const nm = g.kids[0].atom;
+      if (!gIdx.has(nm)) { gIdx.set(nm, globals.length); globals.push(g); }
+    }
+    topStmts.push(...c.topStmts);
+  }
+  return { procs, globals, types, topStmts };
+}
+
+// Emit a complete, self-contained C translation unit for one module.
 function compileModule(snif, opts = {}) {
-  const nodes = readNif(snif);
-  const { procs, globals, types, topStmts } = classify(nodes);
+  return emitUnit(classify(readNif(snif)), opts);
+}
+
+// Emit one whole-program translation unit from several modules linked together
+// (e.g. a program plus the real compiled `system`/`syncio` runtime).
+// mods: [{ src, hash }].
+function compileProgram(mods, opts = {}) {
+  return emitUnit(classifyProgram(mods), opts);
+}
+
+// Emit a C translation unit from already-classified {procs,globals,types,topStmts}.
+function emitUnit(parts, opts = {}) {
+  const { procs, globals, types, topStmts } = parts;
   const em = new Emitter();
   buildExternMaps(em, procs, globals, types);
 
@@ -1055,7 +1122,7 @@ function indentC(src) {
   return out.join("\n");
 }
 
-const api = { readNif, mangleToC, compileModule, compileHarness, Emitter, PRELUDE };
+const api = { readNif, mangleToC, compileModule, compileProgram, compileHarness, Emitter, PRELUDE };
 if (typeof module !== "undefined" && module.exports) module.exports = api;
 if (global) global.NifC = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

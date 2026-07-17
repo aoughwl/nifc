@@ -89,20 +89,24 @@ for (const file of MODULE_BUILDS) {
 // no hand-written runtime. Modules must keep their hash basenames.
 {
   const fs = require("fs");
-  const dir = path.join(EX, "prog_echo");
   const CC = process.env.CC || "gcc";
   const haveCC = cp.spawnSync(CC, ["--version"], { encoding: "utf8" }).status === 0;
-  if (!haveCC || !fs.existsSync(dir)) {
-    console.log("  skip whole-program link (no cc or fixtures)");
-  } else {
+  // [fixture dir, expected stdout, what it exercises]
+  const PROGS = [
+    ["prog_echo", "hi", "echo/string"],
+    ["prog_seqsum", "15", "seq + mimalloc allocator provisions"],
+  ];
+  for (const [name, want, what] of PROGS) {
+    const dir = path.join(EX, name);
+    if (!haveCC || !fs.existsSync(dir)) { console.log(`  skip whole-program link ${name} (no cc or fixtures)`); continue; }
     // runtime modules first, the module with `main` last
     const mods = fs.readdirSync(dir).filter((f) => f.endsWith(".c.nif")).map((f) => path.join(dir, f));
     const main = mods.find((f) => fs.readFileSync(f, "utf8").includes('exportc "main"'));
     const ordered = [...mods.filter((f) => f !== main), main];
     const r = cp.spawnSync("node", [AOWLC, "link-run", ...ordered, "--no-stubs"], { encoding: "utf8" });
     const got = (r.stdout || "").trim();
-    if (r.status === 0 && got === "hi") { console.log("  ok   whole-program link+run echo (compiled runtime) = hi"); pass++; }
-    else { console.log(`  FAIL whole-program link+run => "${got}" (status ${r.status}) ${(r.stderr||"").split("\n")[0]}`); fail++; }
+    if (r.status === 0 && got === want) { console.log(`  ok   whole-program link+run ${name} (${what}) = ${got}`); pass++; }
+    else { console.log(`  FAIL whole-program link+run ${name} => "${got}" (status ${r.status}) ${(r.stderr||"").split("\n")[0]}`); fail++; }
   }
 }
 

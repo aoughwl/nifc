@@ -926,6 +926,18 @@ function compileProgram(mods, opts = {}) {
   return emitUnit(classifyProgram(mods), opts);
 }
 
+// No-header importc runtime symbols that have no libc header to #include and no
+// gcc builtin — provided here backed by libc so a linked program is standalone.
+// The mimalloc allocator is a drop-in malloc replacement, so libc malloc/free is
+// a correct (if unoptimised) backing. Signatures match aowlc's emitted prototype
+// (`void* mi_malloc(NU)`, `void mi_free(void*)`).
+const RUNTIME_PROVISIONS = {
+  mi_malloc:      { needs: ["<stdlib.h>"], impl: "void* mi_malloc(NU n) { return malloc((size_t)n); }" },
+  mi_free:        { needs: ["<stdlib.h>"], impl: "void mi_free(void* p) { free(p); }" },
+  mi_realloc:     { needs: ["<stdlib.h>"], impl: "void* mi_realloc(void* p, NU n) { return realloc(p, (size_t)n); }" },
+  mi_usable_size: { needs: ["<malloc.h>"], impl: "NU mi_usable_size(void* p) { return (NU)malloc_usable_size(p); }" },
+};
+
 // Emit a C translation unit from already-classified {procs,globals,types,topStmts}.
 function emitUnit(parts, opts = {}) {
   const { procs, globals, types, topStmts } = parts;
@@ -959,12 +971,27 @@ function emitUnit(parts, opts = {}) {
   // prototypes for all procs (order-independent calls)
   const protos = [];
   const defs = [];
+  const provisionsNeeded = new Set();
   for (const p of procs) {
     const parts = em.procParts(p);
     // A proc backed by a C header (or explicitly nodecl) is declared by the
     // `#include` we emit for that header — re-declaring it with our own NI/NU
     // typedefs would clash with libc (e.g. `fprintf`'s real FILE*/varargs sig).
     if (em.hasPragma(parts.pragmas, ["header", "nodecl"])) continue;
+    // An `importc` proc is EXTERNAL — it never has a real body. Its IR body is an
+    // empty `(stmts .)`, so emitting it as a definition produces `T f(){}` that
+    // returns garbage (this silently broke every allocation via `mi_malloc`).
+    // Emit a prototype only. `__`-prefixed names are compiler builtins (gcc's
+    // `__atomic_*`) — declaring them would clash, so skip entirely. A handful of
+    // no-header runtime symbols (the mimalloc allocator) have no libc header and
+    // must be provided; record them for a libc-backed provision below.
+    if (em.hasPragma(parts.pragmas, ["importc", "importcpp"])) {
+      const ext = em.externName(parts.pragmas) || parts.nameAtom.atom.split(".")[0];
+      if (ext.startsWith("__")) continue;                 // compiler builtin
+      protos.push(em.procSignature(p).sig + ";");
+      if (RUNTIME_PROVISIONS[ext]) provisionsNeeded.add(ext);
+      continue;
+    }
     const sig = em.procSignature(p);
     if (!parts.body) { protos.push(sig.sig + ";"); continue; }
     // Emit a prototype for every proc, inline included: a `static inline` proc
@@ -1011,6 +1038,15 @@ function emitUnit(parts, opts = {}) {
   for (const g of globals) addHeaders(g.kids[1]);
   for (const td of types) addHeaders(td.kids.find((k) => isList(k) && k.tag === "pragmas"));
 
+  // libc-backed implementations for no-header importc runtime symbols (the
+  // mimalloc allocator) so a linked program is self-contained without -lmimalloc.
+  const provisions = [];
+  for (const name of provisionsNeeded) {
+    const pv = RUNTIME_PROVISIONS[name];
+    for (const h of pv.needs) headers.add(h);
+    provisions.push(pv.impl);
+  }
+
   let out = PRELUDE + "\n";
   if (headers.size) {
     out += "/* --- imported C headers --- */\n" +
@@ -1021,6 +1057,7 @@ function emitUnit(parts, opts = {}) {
   if (typeDecls.length) out += "/* --- types --- */\n" + typeDecls.join("\n") + "\n\n";
   if (protos.length) out += "/* --- prototypes --- */\n" + protos.join("\n") + "\n\n";
   if (stubs.length) out += "/* --- external stubs --- */\n" + stubs.join("\n") + "\n\n";
+  if (provisions.length) out += "/* --- runtime provisions (no-header importc) --- */\n" + provisions.join("\n") + "\n\n";
   if (data.length) out += "/* --- globals --- */\n" + data.join("\n") + "\n\n";
   if (defs.length) out += "/* --- procedures --- */\n" + defs.join("\n\n") + "\n\n";
   if (inits.length) {

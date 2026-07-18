@@ -6,3 +6,5 @@ a.out
 /tmp-*/
 nimcache/
 bin/aowlc-native
+.build-lengc/
+bin/aowlc-lengc
